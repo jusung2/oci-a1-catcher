@@ -14,8 +14,10 @@ BOOT_GB="${BOOT_GB:-100}"
 DISPLAY_NAME="${DISPLAY_NAME:-parkgolf-api}"
 
 # 한 번의 워크플로 실행이 시도를 이어가는 시간과 시도 간격
+# LaunchInstance 호출 자체가 용량 없음을 돌려주는 데 약 100초 걸린다.
+# 대기를 짧게 잡아도 실제 호출 간격은 2분 남짓이 된다.
 RUN_SECONDS="${RUN_SECONDS:-480}"
-ATTEMPT_INTERVAL="${ATTEMPT_INTERVAL:-75}"
+ATTEMPT_INTERVAL="${ATTEMPT_INTERVAL:-25}"
 
 IFS=',' read -r -a ADS <<< "$OCI_ADS"
 
@@ -61,7 +63,7 @@ on_success() {
   local ad="$1" instance_id ip
   instance_id=$(echo "$LAUNCH_OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null)
 
-  log "🎉 생성 성공! ${ad##*-} / instance-id: $instance_id"
+  log "🎉 생성 성공! AD-${ad##*-} / instance-id: $instance_id"
 
   # RUNNING이 될 때까지 기다렸다가 공인 IP를 읽는다. 실패해도 인스턴스는 이미 만들어졌다.
   oci compute instance get --instance-id "$instance_id" \
@@ -80,7 +82,7 @@ on_success() {
   summary ""
   summary "| 항목 | 값 |"
   summary "|---|---|"
-  summary "| Availability Domain | \`${ad##*-}\` |"
+  summary "| Availability Domain | \`AD-${ad##*-}\` |"
   summary "| Instance ID | \`$instance_id\` |"
   summary "| 공인 IP | \`${ip:-확인실패}\` |"
   summary "| 사양 | ${OCPUS} OCPU / ${MEMORY_GB}GB / 부팅 ${BOOT_GB}GB |"
@@ -124,7 +126,7 @@ log "감시 시작: ${SHAPE} ${OCPUS}코어/${MEMORY_GB}GB, 부팅 ${BOOT_GB}GB,
 while (( SECONDS < deadline )); do
   ad="${ADS[$(( attempt % ${#ADS[@]} ))]}"
   attempt=$(( attempt + 1 ))
-  log "시도 ${attempt} — ${ad##*-}"
+  log "시도 ${attempt} — AD-${ad##*-}"
 
   if try_launch "$ad"; then
     on_success "$ad"
