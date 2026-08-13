@@ -1,0 +1,84 @@
+name: OCI A1 Catcher
+
+on:
+  schedule:
+    # 10분마다. GitHub 부하에 따라 수 분 지연되거나 건너뛸 수 있다.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+# 실행이 겹쳐서 인스턴스를 두 개 만드는 일이 없도록 한 번에 하나만 돈다.
+concurrency:
+  group: oci-a1-catcher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: OCI CLI 설치
+        run: pip install --quiet -r requirements.txt
+
+      - name: OCI 인증 키 준비
+        env:
+          KEY: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+
+      - name: A1 용량 확보 시도
+        id: hunt
+        env:
+          OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+          OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/key.pem
+          OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+          OCI_SUBNET: ${{ secrets.OCI_SUBNET }}
+          OCI_IMAGE: ${{ secrets.OCI_IMAGE }}
+          OCI_SSH_PUBKEY: ${{ secrets.OCI_SSH_PUBKEY }}
+          OCI_ADS: ${{ secrets.OCI_ADS }}
+        run: ./catch.sh
+
+      - name: 확보 성공 시 이슈 생성
+        if: steps.hunt.outputs.caught == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IP: ${{ steps.hunt.outputs.public_ip }}
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+        run: |
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "🎉 A1 인스턴스 확보 성공 — $IP" \
+            --body "$(cat <<EOF
+          Oracle Cloud Ampere A1 인스턴스를 확보했습니다.
+
+          | 항목 | 값 |
+          |---|---|
+          | 공인 IP | \`$IP\` |
+          | Instance ID | \`$INSTANCE_ID\` |
+          | 사양 | 2 OCPU / 12GB / 부팅 100GB |
+
+          접속:
+
+          \`\`\`
+          ssh -i ~/.ssh/oci_parkgolf ubuntu@$IP
+          \`\`\`
+
+          이후 이 워크플로는 기존 인스턴스를 감지하고 아무것도 하지 않습니다.
+          더 이상 필요 없으면 Actions 탭에서 비활성화하세요.
+          EOF
+          )"
