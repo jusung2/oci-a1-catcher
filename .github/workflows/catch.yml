@@ -40,7 +40,8 @@ jobs:
   catch:
     if: inputs.test_notification != true
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # catch.sh가 45분간 시도하므로 그보다 넉넉하게 잡는다.
+    timeout-minutes: 55
 
     steps:
       - uses: actions/checkout@v4

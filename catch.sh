@@ -13,11 +13,13 @@ MEMORY_GB="${MEMORY_GB:-12}"
 BOOT_GB="${BOOT_GB:-100}"
 DISPLAY_NAME="${DISPLAY_NAME:-parkgolf-api}"
 
-# 한 번의 워크플로 실행이 시도를 이어가는 시간과 시도 간격
-# LaunchInstance 호출 자체가 용량 없음을 돌려주는 데 약 100초 걸린다.
-# 대기를 짧게 잡아도 실제 호출 간격은 2분 남짓이 된다.
-RUN_SECONDS="${RUN_SECONDS:-480}"
-ATTEMPT_INTERVAL="${ATTEMPT_INTERVAL:-25}"
+# 한 번의 워크플로 실행이 시도를 이어가는 시간과 시도 간격.
+# 스케줄이 10분마다 걸려 있어도 GitHub이 대부분을 건너뛰어 실제 실행은 한 시간에 한 번꼴이다.
+# 그래서 한 번 깨어났을 때 최대한 오래 던지고 다음 실행을 기다린다.
+RUN_SECONDS="${RUN_SECONDS:-2700}"
+ATTEMPT_INTERVAL="${ATTEMPT_INTERVAL:-30}"
+# 429를 맞으면 이 시간만큼 쉬었다 재개하고, 연속 3회면 이번 실행을 접는다.
+RATE_LIMIT_BACKOFF="${RATE_LIMIT_BACKOFF:-300}"
 
 IFS=',' read -r -a ADS <<< "$OCI_ADS"
 
@@ -45,7 +47,10 @@ fi
 # ── 생성 시도 ──────────────────────────────────────────────────────────
 try_launch() {
   local ad="$1"
+  # --no-retry: 용량 없음이 500으로 오기 때문에 CLI 기본 재시도가 걸려
+  # 호출 하나가 100초씩 잡아먹는다. 재시도는 우리 루프가 대신한다.
   LAUNCH_OUT=$(oci compute instance launch \
+    --no-retry \
     --availability-domain "$ad" \
     --compartment-id "$OCI_CLI_TENANCY" \
     --shape "$SHAPE" \
@@ -97,7 +102,7 @@ classify_failure() {
   if grep -qiE 'out of (host )?capacity' <<< "$LAUNCH_OUT"; then
     log "  → 용량 없음"
   elif grep -qiE 'toomanyrequests|429|rate limit' <<< "$LAUNCH_OUT"; then
-    log "  → ⚠️ 레이트 리밋. 이번 실행은 여기서 접습니다."
+    log "  → ⚠️ 레이트 리밋"
     return 2
   elif grep -qiE 'limitexceeded|quota' <<< "$LAUNCH_OUT"; then
     log "❌ 한도 초과 — 재시도해도 소용없습니다."
@@ -120,6 +125,7 @@ classify_failure() {
 
 deadline=$(( SECONDS + RUN_SECONDS ))
 attempt=0
+throttled=0
 
 log "감시 시작: ${SHAPE} ${OCPUS}코어/${MEMORY_GB}GB, 부팅 ${BOOT_GB}GB, ${RUN_SECONDS}초 동안 ${ATTEMPT_INTERVAL}초 간격"
 
@@ -136,7 +142,17 @@ while (( SECONDS < deadline )); do
   classify_failure
   case $? in
     1) emit caught false; exit 1 ;;
-    2) break ;;
+    2)
+      throttled=$(( throttled + 1 ))
+      if (( throttled >= 3 )); then
+        log "레이트 리밋이 3회 연속입니다. 이번 실행은 여기서 접습니다."
+        break
+      fi
+      log "  → ${RATE_LIMIT_BACKOFF}초 쉬었다가 계속합니다."
+      sleep "$RATE_LIMIT_BACKOFF"
+      continue
+      ;;
+    *) throttled=0 ;;
   esac
 
   sleep "$ATTEMPT_INTERVAL"
