@@ -14,12 +14,15 @@ BOOT_GB="${BOOT_GB:-100}"
 DISPLAY_NAME="${DISPLAY_NAME:-parkgolf-api}"
 
 # 한 번의 워크플로 실행이 시도를 이어가는 시간과 시도 간격.
-# 스케줄이 10분마다 걸려 있어도 GitHub이 대부분을 건너뛰어 실제 실행은 한 시간에 한 번꼴이다.
-# 그래서 한 번 깨어났을 때 최대한 오래 던지고 다음 실행을 기다린다.
-RUN_SECONDS="${RUN_SECONDS:-2700}"
+# 스케줄이 10분마다 걸려 있어도 GitHub이 대부분을 건너뛰어, 실행 사이에 2~4시간씩 비는 일이 잦았다.
+# 그래서 한 번 깨어나면 job 상한(6시간)에 가깝게 오래 던진다. 공개 리포는 Actions 분량이 무료라 비용은 없다.
+RUN_SECONDS="${RUN_SECONDS:-18000}"
 ATTEMPT_INTERVAL="${ATTEMPT_INTERVAL:-30}"
-# 429를 맞으면 이 시간만큼 쉬었다 재개하고, 연속 3회면 이번 실행을 접는다.
-RATE_LIMIT_BACKOFF="${RATE_LIMIT_BACKOFF:-300}"
+# 429를 맞으면 이 시간만큼 쉬었다 재개한다. 실제 로그를 보면 429는 우리 호출량과 무관하게
+# 무작위 시점에 오므로 길게 쉴 이유가 없다. 연속 3회면 한 번 길게 쉬고 계속한다.
+# (예전처럼 실행을 접어 버리면 다음 스케줄이 잡힐 때까지 몇 시간을 통째로 잃는다.)
+RATE_LIMIT_BACKOFF="${RATE_LIMIT_BACKOFF:-90}"
+RATE_LIMIT_LONG_BACKOFF="${RATE_LIMIT_LONG_BACKOFF:-600}"
 
 IFS=',' read -r -a ADS <<< "$OCI_ADS"
 
@@ -65,22 +68,30 @@ try_launch() {
 }
 
 on_success() {
-  local ad="$1" instance_id ip
+  local ad="$1" instance_id ip=""
   instance_id=$(echo "$LAUNCH_OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin)["data"]["id"])' 2>/dev/null)
 
-  log "🎉 생성 성공! AD-${ad##*-} / instance-id: $instance_id"
+  if [[ -z "$instance_id" ]]; then
+    log "생성 호출은 성공했는데 응답에서 instance-id를 못 읽었습니다. 원본 출력:"
+    echo "$LAUNCH_OUT" | head -30
+  fi
 
-  # RUNNING이 될 때까지 기다렸다가 공인 IP를 읽는다. 실패해도 인스턴스는 이미 만들어졌다.
-  oci compute instance get --instance-id "$instance_id" \
-    --wait-for-state RUNNING --wait-interval-seconds 10 --max-wait-seconds 300 >/dev/null 2>&1
+  log "🎉 생성 성공! AD-${ad##*-} / instance-id: ${instance_id:-unknown}"
 
-  ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
-       --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+  # 아래 RUNNING 대기 중에 job이 끊기더라도 알림·비활성화 스텝이 돌도록 결과부터 기록한다.
+  emit caught true
+  emit instance_id "${instance_id:-unknown}"
+
+  if [[ -n "$instance_id" ]]; then
+    # RUNNING이 될 때까지 기다렸다가 공인 IP를 읽는다. 실패해도 인스턴스는 이미 만들어졌다.
+    oci compute instance get --instance-id "$instance_id" \
+      --wait-for-state RUNNING --wait-interval-seconds 10 --max-wait-seconds 300 >/dev/null 2>&1
+
+    ip=$(oci compute instance list-vnics --instance-id "$instance_id" \
+         --query 'data[0]."public-ip"' --raw-output 2>/dev/null)
+  fi
 
   log "공인 IP: ${ip:-확인실패}"
-
-  emit caught true
-  emit instance_id "$instance_id"
   emit public_ip "${ip:-unknown}"
 
   summary "## 🎉 A1 인스턴스 확보 성공"
@@ -88,7 +99,7 @@ on_success() {
   summary "| 항목 | 값 |"
   summary "|---|---|"
   summary "| Availability Domain | \`AD-${ad##*-}\` |"
-  summary "| Instance ID | \`$instance_id\` |"
+  summary "| Instance ID | \`${instance_id:-unknown}\` |"
   summary "| 공인 IP | \`${ip:-확인실패}\` |"
   summary "| 사양 | ${OCPUS} OCPU / ${MEMORY_GB}GB / 부팅 ${BOOT_GB}GB |"
   summary ""
@@ -97,11 +108,12 @@ on_success() {
   summary "\`\`\`"
 }
 
-# 실패 원인 분류. 재시도가 무의미한 오류면 1을 반환한다.
+# 실패 원인 분류. 재시도가 무의미한 오류면 1, 레이트 리밋이면 2를 반환한다.
 classify_failure() {
   if grep -qiE 'out of (host )?capacity' <<< "$LAUNCH_OUT"; then
     log "  → 용량 없음"
-  elif grep -qiE 'toomanyrequests|429|rate limit' <<< "$LAUNCH_OUT"; then
+  # 429는 opc-request-id 같은 16진수 문자열 안에도 흔히 들어가므로 숫자만으로 판별하지 않는다.
+  elif grep -qiE 'toomanyrequests|"status": *429|rate limit' <<< "$LAUNCH_OUT"; then
     log "  → ⚠️ 레이트 리밋"
     return 2
   elif grep -qiE 'limitexceeded|quota' <<< "$LAUNCH_OUT"; then
@@ -126,8 +138,9 @@ classify_failure() {
 deadline=$(( SECONDS + RUN_SECONDS ))
 attempt=0
 throttled=0
+rate_limited=0
 
-log "감시 시작: ${SHAPE} ${OCPUS}코어/${MEMORY_GB}GB, 부팅 ${BOOT_GB}GB, ${RUN_SECONDS}초 동안 ${ATTEMPT_INTERVAL}초 간격"
+log "감시 시작: ${SHAPE} ${OCPUS}코어/${MEMORY_GB}GB, 부팅 ${BOOT_GB}GB, ${RUN_SECONDS}초 동안 ${ATTEMPT_INTERVAL}초 간격 (429 시 ${RATE_LIMIT_BACKOFF}초, 연속 3회면 ${RATE_LIMIT_LONG_BACKOFF}초 대기)"
 
 while (( SECONDS < deadline )); do
   ad="${ADS[$(( attempt % ${#ADS[@]} ))]}"
@@ -144,12 +157,15 @@ while (( SECONDS < deadline )); do
     1) emit caught false; exit 1 ;;
     2)
       throttled=$(( throttled + 1 ))
+      rate_limited=$(( rate_limited + 1 ))
       if (( throttled >= 3 )); then
-        log "레이트 리밋이 3회 연속입니다. 이번 실행은 여기서 접습니다."
-        break
+        log "  → 레이트 리밋이 3회 연속입니다. ${RATE_LIMIT_LONG_BACKOFF}초 길게 쉬었다가 계속합니다."
+        sleep "$RATE_LIMIT_LONG_BACKOFF"
+        throttled=0
+      else
+        log "  → ${RATE_LIMIT_BACKOFF}초 쉬었다가 계속합니다."
+        sleep "$RATE_LIMIT_BACKOFF"
       fi
-      log "  → ${RATE_LIMIT_BACKOFF}초 쉬었다가 계속합니다."
-      sleep "$RATE_LIMIT_BACKOFF"
       continue
       ;;
     *) throttled=0 ;;
@@ -158,6 +174,7 @@ while (( SECONDS < deadline )); do
   sleep "$ATTEMPT_INTERVAL"
 done
 
-log "이번 실행에서는 확보 실패 (${attempt}회 시도). 다음 스케줄에서 계속합니다."
+log "이번 실행에서는 확보 실패 (${attempt}회 시도, 레이트 리밋 ${rate_limited}회). 다음 스케줄에서 계속합니다."
+summary "이번 실행: ${attempt}회 시도, 레이트 리밋 ${rate_limited}회. 확보 실패."
 emit caught false
 exit 0
